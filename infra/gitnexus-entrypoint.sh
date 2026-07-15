@@ -62,7 +62,7 @@ else
             echo "GitNexus: Cloning $REPO_URL..."
             git clone --depth 1 "$REPO_URL" "$REPO_PATH" 2>&1 || {
                 echo "GitNexus: Clone failed, starting eval-server with no repos..."
-                exec gitnexus eval-server --port "$PORT" --idle-timeout 0 2>&1
+                exec gitnexus eval-server --port "$PORT" --host 0.0.0.0 --idle-timeout 0 2>&1
             }
         else
             echo "GitNexus: Repo already cloned at $REPO_PATH"
@@ -119,7 +119,7 @@ fi
 
 # Start the eval-server in the background
 echo "GitNexus: Starting eval-server on port $PORT..."
-gitnexus eval-server --port "$PORT" --idle-timeout 0 &
+gitnexus eval-server --port "$PORT" --host 0.0.0.0 --idle-timeout 0 &
 EVAL_PID=$!
 
 # Run background watchdog daemon to index new/re-indexed repos
