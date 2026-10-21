@@ -24,7 +24,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "matcher": "Edit|Write|NotebookEdit|Bash|Grep|Glob",
         "hooks": [
           {
             "type": "command",
@@ -48,6 +48,15 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/nudge-lookup.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*cortex_session_start",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-id.sh\""
           }
         ]
       },

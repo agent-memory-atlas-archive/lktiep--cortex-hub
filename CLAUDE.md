@@ -43,6 +43,9 @@ finding the spot in one call and spending five:
 - **Don't re-search the same question.** Recall@10 is 1.000, so a reworded query returns
   the same set for another round trip. If nothing fits, ask a *different* question or
   switch tool — don't paraphrase.
+- **Read the lines a hit names, not the file.** Each hit carries its line range (`L120-168`):
+  Read with that offset and limit, or `rg -n` inside the file. A whole file is often ten
+  times the chunk you came for.
 
 ### The rest of the toolbox
 
@@ -113,9 +116,10 @@ Every session must pass before committing:
 `.claude/hooks/` gates tools on recorded evidence of cortex calls (see `scripts/test-hooks.sh`):
 
 - No `cortex_session_start` → every `Edit`, `Write` and file-modifying Bash command is refused.
-- Session started but no discovery call yet → `Grep`, `Glob` and a `grep`/`rg`/`find` that
-  *starts* a command are refused. A `grep` after a pipe (filtering another command's output)
-  is fine.
+- No discovery call yet (`cortex_code_search`, `cortex_code_context`, `cortex_code_impact`,
+  `cortex_cypher`) → `Grep`, `Glob` and a `grep`/`rg`/`find` that *starts* a command are
+  refused, with or without a session. One discovery call unlocks them. A `grep` after a pipe
+  (filtering another command's output) is fine.
 - Editing before `cortex_knowledge_search` **and** `cortex_memory_search` → refused. This
   covers `cat > file` and `sed -i` too, not just the Edit tool. Running a discovery call does
   not retire this: the recalls are required for every write, all session.

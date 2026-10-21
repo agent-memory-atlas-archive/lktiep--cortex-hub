@@ -23,7 +23,7 @@
 set -euo pipefail
 
 HOOKS_VERSION=7
-HOOKS_MINOR=13
+HOOKS_MINOR=14
 MCP_URL_DEFAULT="http://localhost:8318/mcp"
 
 # ── Colors ──
@@ -640,7 +640,7 @@ if [ "$NEEDS_UPDATE" = "true" ]; then
   # ── session-init.sh ──
   cat > .claude/hooks/session-init.sh << 'HOOKEOF'
 #!/bin/bash
-# Cortex Session Init (v7.3) — arms the gates; keeps discovery state across compaction.
+# Cortex Session Init (v7.4) — arms the gates; keeps discovery state across compaction.
 #
 # SessionStart fires on four different things: startup, resume, clear and compact.
 # Wiping the discovery markers on all four is why a long task suddenly finds Grep and
@@ -655,32 +655,27 @@ if [ "$NEEDS_UPDATE" = "true" ]; then
 # v7.2 prints this conversation's id for /cs to pass as clientSessionId. Everything else the
 # hub matches a session on is the same for two conversations in one checkout, so without it
 # they shared one session, and the first to finish closed it under the other.
+#
+# v7.4 stops printing it. A line that differs in every conversation, this early in the
+# context, kept the prompt cache from reusing anything after it. session-id.sh now puts the
+# id straight into the cortex_session_start call.
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 STATE_DIR="$PROJECT_DIR/.cortex/.session-state"
 mkdir -p "$STATE_DIR"
 
 INPUT=$(cat 2>/dev/null || true)
 SOURCE=""
-CLIENT_ID=""
 if [ -n "$INPUT" ]; then
   if command -v jq >/dev/null 2>&1; then
     SOURCE=$(printf '%s' "$INPUT" | jq -r '.source // empty' 2>/dev/null || true)
-    CLIENT_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
   elif command -v python3 >/dev/null 2>&1; then
     SOURCE=$(printf '%s' "$INPUT" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("source",""))' 2>/dev/null || true)
-    CLIENT_ID=$(printf '%s' "$INPUT" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null || true)
   fi
 fi
-# The same id the tracker and the exit hook file this conversation's session under.
-CLIENT_ID=$(printf '%s' "$CLIENT_ID" | tr -cd 'A-Za-z0-9_-' | cut -c1-128)
-conversation_line() {
-  [ -n "$CLIENT_ID" ] && echo "Cortex: this conversation's clientSessionId is ${CLIENT_ID} — pass it to cortex_session_start."
-}
 
 case "$SOURCE" in
   compact|resume)
     echo "Cortex: same session (${SOURCE}) — discovery state kept, gates stay as they were."
-    conversation_line
     exit 0 ;;
 esac
 
@@ -703,14 +698,13 @@ rm -rf "$STATE_DIR/agents" 2>/dev/null
 # File notes are shown once per conversation and agent; the record of which were is a day's.
 [ -d "$STATE_DIR/notes" ] && find "$STATE_DIR/notes" -type f -name 'shown-*' -mtime +1 -exec rm -f {} + 2>/dev/null
 echo "Run /cs first: cortex_session_start, then knowledge+memory recall. Until then edits are BLOCKED, and Grep/Glob stay blocked until a cortex discovery tool has run."
-conversation_line
 exit 0
 HOOKEOF
 
   # ── enforce-session.sh ──
   cat > .claude/hooks/enforce-session.sh << 'HOOKEOF'
 #!/bin/bash
-# Cortex Session Enforcement (v6.2) — hold tools back until the cortex workflow is followed.
+# Cortex Session Enforcement (v6.3) — hold tools back until the cortex workflow is followed.
 #
 # What this can and cannot do: the hook shares a filesystem with the agent it gates, so
 # it cannot stop an agent that decides to forge a marker. What it can do is make the
@@ -835,16 +829,23 @@ fi
 # ── Session NOT started: block writes and codebase search, allow plain reads ──
 # Until v7.1 of session-init this branch never ran: the init hook created the session-started
 # marker itself, so every session looked started before cortex_session_start was ever called.
+#
+# Searching is reading, and what this gate wants before it is a cortex lookup, not a session.
+# Until v6.3 a search stayed blocked here after cortex_code_search had run, under a message
+# saying that very call unlocks it: an agent asked a quick question looked the code up, was
+# refused grep twice, and read whole files instead — 25k characters where one grep would do.
+SEARCH_HINT="BLOCKED: look it up with cortex_code_search (a behaviour) or cortex_code_context (a symbol name) first. One call unlocks find/grep/rg and Grep/Glob for the rest of the session. $HOW_OUT"
 case "$TOOL_NAME" in
   Edit|Write|NotebookEdit)
     echo "BLOCKED: call cortex_session_start first (or run /cs). No edits without a session." >&2
     exit 2 ;;
   Grep|Glob)
-    echo "BLOCKED: run /cs first (cortex_session_start + knowledge/memory recall), then search with cortex_code_search. $HOW_OUT" >&2
+    marker_ok discovery-used && exit 0
+    echo "$SEARCH_HINT" >&2
     exit 2 ;;
   Bash)
-    if is_codebase_search "$COMMAND"; then
-      echo "BLOCKED: run /cs first, then search with cortex_code_search. find/grep/rg unlock once a cortex discovery tool has run. $HOW_OUT" >&2
+    if is_codebase_search "$COMMAND" && ! marker_ok discovery-used; then
+      echo "$SEARCH_HINT" >&2
       exit 2
     fi
     # The write check goes before the read allowlist, or `cat > file` passes as a read.
@@ -852,11 +853,14 @@ case "$TOOL_NAME" in
       echo "BLOCKED: call cortex_session_start first (or run /cs). No file modifications without a session." >&2
       exit 2
     fi
-    [[ "$COMMAND" =~ ^(ls|cat|head|tail|pwd|which|echo|git\ (status|log|diff|branch|remote|show)|pnpm\ |npm\ |yarn\ |cargo\ |go\ |python|curl|dotnet\ |node\ ) ]] && exit 0
-    [[ "$COMMAND" =~ (git\ (add|commit|push|reset)|rm\ |mv\ |cp\ |mkdir\ |touch\ |chmod\ ) ]] && {
+    # Where a command starts, and before the read allowlist: unanchored, `cp ` matched the end of
+    # `hub-mcp ` and refused a read-only grep over that directory, while `ls; rm x` passed as a read.
+    MODIFIES='(^|[;&|(])[[:space:]]*(git[[:space:]]+(add|commit|push|reset)|rm|mv|cp|mkdir|touch|chmod)[[:space:]]'
+    [[ "$COMMAND" =~ $MODIFIES ]] && {
       echo "BLOCKED: call cortex_session_start first (or run /cs). No file modifications without a session." >&2
       exit 2
     }
+    [[ "$COMMAND" =~ ^(ls|cat|head|tail|pwd|which|echo|git\ (status|log|diff|branch|remote|show)|pnpm\ |npm\ |yarn\ |cargo\ |go\ |python|curl|dotnet\ |node\ ) ]] && exit 0
     exit 0 ;;
 esac
 exit 0
@@ -1866,8 +1870,76 @@ printf '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContex
 exit 0
 HOOKEOF
 
+  cat > .claude/hooks/session-id.sh << 'HOOKEOF'
+#!/bin/bash
+# Cortex Session Id (v1.1) — fills in clientSessionId and the agent identity on cortex_session_start.
+#
+# The hub keeps two conversations in one checkout on separate sessions by this id. Until
+# session-init v7.4 the agent copied it from a line that hook printed, but that line differs
+# in every conversation and sits ahead of CLAUDE.md and the rest of the opening context, so
+# the prompt cache could never reuse anything after it: ~6k tokens written anew per
+# conversation, most of what made a hub lookup cost more than a plain grep. The hook payload
+# already carries the id, so it goes straight into the call and the context stays the same.
+#
+# v1.1: the identity too. CLAUDE.md told the agent to read .cortex/agent-identity.json and the
+# git branch before its first call, two more turns in every conversation for values a script
+# can look up. What the agent passes itself still wins; only the id is always this hook's.
+INPUT=$(cat 2>/dev/null || true)
+[ -z "$INPUT" ] && exit 0
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+IDENTITY_FILE="$PROJECT_DIR/.cortex/agent-identity.json"
+BRANCH=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)
+case "${CLAUDE_CODE_ENTRYPOINT:-}" in
+  *vscode*) IDE=claude-code-vscode ;;
+  *) IDE=claude-code-cli ;;
+esac
+
+# The same id, with the same characters kept, that the tracker and the exit hook file this
+# conversation's session under. Whatever the agent passed is replaced: this one is current.
+if command -v jq >/dev/null 2>&1; then
+  IDENTITY=$(jq -c 'if type == "object" then . else {} end' "$IDENTITY_FILE" 2>/dev/null || true)
+  [ -z "$IDENTITY" ] && IDENTITY='{}'
+  printf '%s' "$INPUT" | jq -c --argjson who "$IDENTITY" --arg branch "$BRANCH" --arg ide "$IDE" '
+    (.session_id // "" | gsub("[^A-Za-z0-9_-]"; "") | .[0:128]) as $id
+    | select($id != "")
+    | ($who.environment | if type == "object" then . else {} end) as $env
+    # A value of the wrong type fails the schema of the tool, and with it the whole call, so a
+    # hand-edited file only contributes what it got right.
+    | (({hostname: $env.hostname, os: $env.os, role: $who.role, branch: $branch, ide: $ide}
+        | with_entries(select(.value | type == "string" and . != "")))
+       + ($who.capabilities | if type == "array" and length > 0 and all(type == "string")
+           then {capabilities: .} else {} end)) as $found
+    | {hookSpecificOutput: {hookEventName: "PreToolUse",
+        updatedInput: ($found + (.tool_input // {}) + {clientSessionId: $id})}}' 2>/dev/null
+elif command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$INPUT" | IDENTITY_FILE="$IDENTITY_FILE" BRANCH="$BRANCH" IDE="$IDE" python3 -c '
+import json, os, re, sys
+d = json.load(sys.stdin)
+cid = re.sub(r"[^A-Za-z0-9_-]", "", str(d.get("session_id") or ""))[:128]
+if cid:
+    try:
+        who = json.load(open(os.environ["IDENTITY_FILE"], encoding="utf-8-sig"))
+        who = who if isinstance(who, dict) else {}
+    except Exception:
+        who = {}
+    env = who.get("environment") if isinstance(who.get("environment"), dict) else {}
+    found = {"hostname": env.get("hostname"), "os": env.get("os"), "role": who.get("role"),
+             "branch": os.environ.get("BRANCH"), "ide": os.environ.get("IDE")}
+    args = {k: v for k, v in found.items() if isinstance(v, str) and v}
+    caps = who.get("capabilities")
+    if isinstance(caps, list) and caps and all(isinstance(c, str) for c in caps):
+        args["capabilities"] = caps
+    args.update(d.get("tool_input") or {})
+    args["clientSessionId"] = cid
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": args}}))
+' 2>/dev/null
+fi
+exit 0
+HOOKEOF
+
   chmod +x .claude/hooks/*.sh
-  ok "Hooks: all 8 hooks installed (v${HOOKS_VERSION}.${HOOKS_MINOR})"
+  ok "Hooks: all 9 hooks installed (v${HOOKS_VERSION}.${HOOKS_MINOR})"
 
   # ── settings.json ──
   # Call bash directly — works on macOS (native) and Windows (Git Bash).
@@ -1901,7 +1973,7 @@ HOOKEOF
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "matcher": "Edit|Write|NotebookEdit|Bash|Grep|Glob",
         "hooks": [
           {
             "type": "command",
@@ -1925,6 +1997,15 @@ HOOKEOF
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/nudge-lookup.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*cortex_session_start",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-id.sh\""
           }
         ]
       },
@@ -1982,9 +2063,11 @@ with open('$USER_SETTINGS','w') as f: json.dump(d, f, indent=2)
   # ── Slash commands (/cs, /ce) ──
   mkdir -p .claude/commands
   cat > .claude/commands/cs.md << 'CMDEOF'
-# /cs — Cortex Start v0.9.1
+# /cs — Cortex Start v0.9.3
 
-> Version: 0.9.1 | Updated: 2026-10-09
+> Version: 0.9.3 | Updated: 2026-10-21
+> Changelog: v0.9.3 — the hook fills in the IDE, branch and identity too; no step for a field the hub never returned
+> Changelog: v0.9.2 — clientSessionId is filled in by a hook, so the opening context is the same every time and stays cached
 > Changelog: v0.9.1 — passes clientSessionId, so parallel conversations in one checkout get a session each
 > Changelog: v0.9.0 — cortex_plan_quality is actually registered; it scores 0-10 and takes the request too
 > Changelog: v0.8.0 — search-once/read-all-ten ordering from measured retrieval; recall no longer counts as discovery
@@ -2000,14 +2083,10 @@ Call `cortex_session_start`:
 repo: "__GIT_REPO__"
 mode: "development"
 agentId: "claude-code"
-ide: "<your IDE>"
-branch: "<current git branch>"
-clientSessionId: "<the id from the SessionStart hook's 'clientSessionId is …' line>"
 ```
-Leave `clientSessionId` out only if no hook printed one. Without it, two conversations in this
-checkout share one hub session, and the first to end closes it under the other.
+Nothing else: the `session-id.sh` hook adds this conversation's id (so two conversations in one
+checkout get a session each), the git branch, the IDE and `.cortex/agent-identity.json`.
 Save `session_id`, `projectId` and `project.orgId` from the response. `orgId` is the boundary of a cross-repo search.
-If `recentChanges.count > 0` → warn user and `git pull` before any edits.
 
 ## Step 2: Recall Context (parallel)
 Call BOTH in parallel:
@@ -2239,7 +2318,7 @@ GHOOKEOF
 
     cat > .gemini/hooks/enforce-session.sh << 'GHOOKEOF'
 #!/bin/bash
-# Cortex Session Enforcement (v6.1) — Gemini variant.
+# Cortex Session Enforcement (v6.2) — Gemini variant.
 #
 # v3 only checked that a session existed: once cortex_session_start had run, every tool was
 # allowed. So the discovery-first rule was documentation, not enforcement. This mirrors the
@@ -2320,14 +2399,16 @@ if [ -f "$STATE_DIR/session-started" ]; then
   allow
 fi
 
-# Session not started: block writes and codebase search, allow plain reads.
+# Session not started: block writes and codebase search, allow plain reads. Searching is
+# reading, so a cortex lookup unlocks it here as it does in a session — see the Claude hook.
+SEARCH_HINT="BLOCKED: look it up with cortex_code_search (a behaviour) or cortex_code_context (a symbol name) first. One call unlocks find/grep/rg, glob and search_file_content for the rest of the session. $HOW_OUT"
 case "$TOOL_NAME" in
   write_file|replace|edit_file|create_file|insert_text)
     deny "BLOCKED: call cortex_session_start first. No edits without a session." ;;
   glob|search_file_content)
-    deny "BLOCKED: call cortex_session_start first, then search with cortex_code_search. $HOW_OUT" ;;
+    marker_ok discovery-used || deny "$SEARCH_HINT" ;;
   run_shell_command|shell)
-    is_codebase_search "$COMMAND" && deny "BLOCKED: call cortex_session_start first, then search with cortex_code_search. $HOW_OUT"
+    is_codebase_search "$COMMAND" && ! marker_ok discovery-used && deny "$SEARCH_HINT"
     is_file_write "$COMMAND" && ! is_gate_off_write "$COMMAND" \
       && deny "BLOCKED: call cortex_session_start first. No file modifications without a session."
     printf '%s' "$COMMAND" | grep -Eq '(git[[:space:]]+(add|commit|push|reset)|^rm[[:space:]]|^mv[[:space:]]|^cp[[:space:]]|^mkdir[[:space:]])' \
@@ -2793,8 +2874,7 @@ GSETTINGS
 
 At the START of every conversation:
 1. Call \`cortex_session_start\` with repo: "$GIT_REPO", agentId: "$agent_id", mode: "development"
-2. If \`recentChanges.count > 0\`, warn user and run \`git pull\`
-3. \`cortex_knowledge_search\` + \`cortex_memory_search\` once — recall what the last session decided
+2. \`cortex_knowledge_search\` + \`cortex_memory_search\` once — recall what the last session decided
 
 ### Finding code — start from what you know, not from a fixed ladder
 | You already know | Start with |
@@ -3196,39 +3276,23 @@ inject_claude_md() {
 <!-- cortex-hub:auto-mcp -->
 ## Cortex Hub — MANDATORY (enforced by hooks — violations are BLOCKED)
 
-**YOUR FIRST ACTION in every conversation MUST be calling `cortex_session_start`.
-If you skip this, all Edit/Write/file-modifying Bash commands will return exit code 2 (BLOCKED).
-This is not optional — it is enforced by pre-tool hooks.**
+**Call `cortex_session_start` in the first turn of every conversation.** Without it, every
+Edit, Write and file-modifying Bash command is refused by a hook (exit code 2). It does not
+depend on anything else, so send it in the same message as your first lookup, not a turn of
+its own.
 
 ```
 cortex_session_start(repo: "__GIT_REPO__", mode: "development", agentId: "claude-code")
 ```
 
-Then:
-- If `recentChanges.count > 0` in the response, warn the user and run `git pull`
-
-### Agent Identity (send with session_start if available)
-
-Read `.cortex/agent-identity.json` and pass identity fields:
-```
-cortex_session_start(
-  repo: "__GIT_REPO__",
-  mode: "development",
-  agentId: "claude-code",
-  hostname: "<from agent-identity.json>",
-  os: "<from agent-identity.json>",
-  ide: "claude-code-cli",
-  branch: "<current git branch>",
-  role: "<from agent-identity.json>",
-  capabilities: ["<from agent-identity.json>"]
-)
-```
-This helps Dashboard identify which agent you are across multiple IDEs/machines.
+Pass nothing else: a hook adds the id of this conversation, the git branch, the IDE and the
+fields of `.cortex/agent-identity.json`, so the dashboard can tell your machines and IDEs apart.
 
 ### Finding code fast (MANDATORY — and a fixed ladder is the slow way)
 
-Start from what you already know. Grep and Glob are blocked by a hook until a cortex
-discovery tool has run in this session.
+Start from what you already know. Until one cortex discovery call has run in this session,
+a hook refuses Grep, Glob and a Bash command that starts with `grep`, `rg` or `find`, even
+for a literal: make the cortex call first, then grep freely.
 
 | You already know | Start with | Why |
 |---|---|---|
@@ -3241,6 +3305,10 @@ discovery tool has run in this session.
 file is in the top 10 for 15/15 queries, top 3 for 11/15, rank 1 for only 8/15. So scan all ten
 hits before choosing, and do not re-run a reworded version of the same query — recall@10 is
 already 1.000, so it returns the same set. Ask a different question or switch tool instead.
+
+**Read the lines a hit names, not the file.** Each hit carries its line range (`L120-168`):
+Read with that offset and limit, or `rg -n` inside the file. A whole file is often ten times
+the chunk you came for.
 
 `cortex_code_impact` before editing something exported or shared — not as a ritual on every file.
 

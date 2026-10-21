@@ -17,6 +17,9 @@ export const intelRouter = new Hono()
 const QDRANT_URL = process.env.QDRANT_URL ?? 'http://qdrant:6333'
 const REPOS_DIR = process.env.REPOS_DIR ?? '/app/data/repos'
 
+/** Code search over-fetch, so the copies other branches hold of a chunk do not crowd out the limit. */
+const BRANCH_OVERFETCH = 3
+
 /** Max file size for code_read (512KB) */
 const MAX_READ_SIZE = 512 * 1024
 
@@ -40,7 +43,8 @@ async function callGitNexus(
   const text = await res.text()
 
   if (!res.ok) {
-    throw new Error(text || `GitNexus ${tool} failed: ${res.status}`)
+    // "Multiple repositories indexed ... Available: <every repo>" names other organizations' repos.
+    throw new Error(text.replace(/\s*Available: [^\n]*/g, '') || `GitNexus ${tool} failed: ${res.status}`)
   }
 
   // GitNexus may return JSON or plain text
@@ -280,7 +284,7 @@ async function callGitNexusWithFallback(
   orgId?: string,
 ): Promise<unknown> {
   if (!projectId) {
-    return callGitNexus(tool, params)
+    return callGitNexusAcrossOrg(tool, params, orgId)
   }
 
   const candidates = resolveRepoNames(projectId, orgId)
@@ -306,6 +310,54 @@ async function callGitNexusWithFallback(
   } catch {
     throw lastError
   }
+}
+
+function indexedProjectsOf(orgId: string): Array<{ id: string; name: string }> {
+  return db.prepare('SELECT id, name FROM projects WHERE org_id = ? AND indexed_symbols > 0 ORDER BY name')
+    .all(orgId) as Array<{ id: string; name: string }>
+}
+
+/** A GitNexus answer that names nothing: the symbol is not in that repo, or the query failed. */
+function foundNothing(result: unknown): boolean {
+  const text = typeof (result as { raw?: unknown })?.raw === 'string' ? (result as { raw: string }).raw : JSON.stringify(result)
+  return /not found|^Error/i.test(text ?? '')
+}
+
+/**
+ * A graph lookup that names no project. GitNexus without a repo answers only while it holds a
+ * single one; with more it refused, and listed every repo it holds, every organization's. So each
+ * indexed project of the caller's organization is asked by its own name, and the answers that
+ * found something are kept, under the project's name when there are several.
+ */
+async function callGitNexusAcrossOrg(tool: string, params: Record<string, unknown>, orgId?: string): Promise<unknown> {
+  if (!orgId) {
+    if (orgsWithIndexedProjects().length > 1) {
+      throw new Error('Several organizations hold indexed code: name the repo, or pass org.')
+    }
+    return callGitNexus(tool, params)
+  }
+  const projects = indexedProjectsOf(orgId)
+  if (projects.length === 0) return callGitNexus(tool, params)
+  if (projects.length === 1) return callGitNexusWithFallback(tool, params, projects[0]?.id, orgId)
+
+  const answers = await Promise.all(projects.map(async (project) => {
+    try {
+      return { project, result: await callGitNexusWithFallback(tool, params, project.id, orgId) }
+    } catch (error) {
+      return { project, error }
+    }
+  }))
+  const found = answers.filter((a) => !a.error && !foundNothing(a.result))
+  if (found.length === 1) return found[0]?.result
+  if (found.length > 1) {
+    if (found.every((a) => typeof (a.result as { raw?: unknown }).raw === 'string')) {
+      return { raw: found.map((a) => `## ${a.project.name}\n${(a.result as { raw: string }).raw}`).join('\n\n') }
+    }
+    return found[0]?.result
+  }
+  const answered = answers.find((a) => !a.error)
+  if (answered) return answered.result
+  throw answers[0]?.error ?? new Error(`GitNexus ${tool} failed`)
 }
 
 /**
@@ -335,8 +387,12 @@ type GitNexusResult = Record<string, any>
 /**
  * Post-process GitNexus raw text to replace CLI hints with MCP tool references.
  */
-function rewriteGitNexusHints(text: string): string {
+export function rewriteGitNexusHints(text: string): string {
   return text
+    // A symbol with no kind prints as "undefined": a flow step as "undefined main → file", an
+    // edge as "[calls] undefined index.ts → file". It is noise in every result an agent reads.
+    .replace(/^(\s+)undefined (?=\S)/gm, '$1')
+    .replace(/(\[\w+\]) undefined (?=\S)/g, '$1 ')
     .replace(/gitnexus-context/g, 'cortex_code_context')
     .replace(/gitnexus-impact/g, 'cortex_code_impact')
     .replace(/gitnexus-query/g, 'cortex_code_search')
@@ -353,6 +409,97 @@ function rewriteGitNexusHints(text: string): string {
       'Tip: Use cortex_code_context with file parameter to disambiguate.',
     )
     .replace(/Read the source with cat /g, 'Examine the source at ')
+}
+
+const CYPHER_SCHEMA_HINT =
+  '💡 Node labels: Function, Method, Class, Interface, TypeAlias, Const, Property, File, Folder, Route. ' +
+  'Every edge is one table, CodeRelation, with its kind in r.type (CALLS, IMPORTS, DEFINES, HAS_METHOD, ' +
+  'EXTENDS, IMPLEMENTS, ACCESSES, HANDLES_ROUTE). Properties: id, name, filePath, startLine, endLine.\n' +
+  'Example: MATCH (a)-[r:CodeRelation {type: \'CALLS\'}]->(b:Function {name: \'X\'}) RETURN a.name, labels(a) AS type, a.filePath LIMIT 20'
+
+/**
+ * A cypher answer as an agent reads it. The graph returns a table as JSON — {"markdown": "| a |
+ * …", "row_count": 2} — which reached agents escaped twice, every row break a literal \n. And it
+ * answers a failed query with HTTP 200 and an "Error:" body, so the schema is named right there:
+ * the usual failure is guessing an edge table such as [:CALLS], which does not exist.
+ */
+export function formatCypherRaw(raw: string): string {
+  let text = rewriteGitNexusHints(raw).replace(/^\{\n[\s\S]*?\n\}$/gm, (block) => {
+    try {
+      const { markdown, row_count: rows } = JSON.parse(block) as { markdown?: unknown; row_count?: unknown }
+      return typeof markdown === 'string' ? `${markdown}\n(${String(rows)} row${rows === 1 ? '' : 's'})` : block
+    } catch {
+      return block
+    }
+  })
+  if (/^Error:/m.test(text) && /does not exist|Cannot find property|Binder exception/.test(text)) {
+    text += `\n${CYPHER_SCHEMA_HINT}`
+  }
+  return text
+}
+
+const MAX_CALL_SITES = 6
+
+/**
+ * The lines of each caller's file that name the symbol. The graph keeps one edge per file and
+ * prints the caller as a bare path, so every lookup of callers was followed by an `rg` of the
+ * repository for the line numbers. Import lines are left out: they name the symbol but call
+ * nothing. A file the checkout does not hold, or no longer names the symbol in, stays bare.
+ */
+export function addCallSites(raw: string, name: string, readSource: (path: string) => string | undefined): string {
+  // A method asked for as `Class.method` is called as `.method`.
+  const word = name.split(/[.:#]/).pop() ?? name
+  const named = new RegExp(`(^|[^\\w$])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`)
+  const withSites = (line: string, head: string, path: string, tail = ''): string => {
+    if (/:\d/.test(path)) return line
+    const lines = readSource(path)?.split('\n')
+    if (!lines) return line
+    const sites: number[] = []
+    lines.forEach((text, i) => {
+      if (named.test(text) && !/^\s*import\b/.test(text)) sites.push(i + 1)
+    })
+    if (sites.length === 0) return line
+    const more = sites.length > MAX_CALL_SITES ? ` (+${sites.length - MAX_CALL_SITES} more)` : ''
+    return `${head}${path}:${sites.slice(0, MAX_CALL_SITES).join(',')}${more}${tail}`
+  }
+  return raw
+    // code_context: "  ← [calls] intel.ts → apps/api/src/routes/intel.ts"
+    .replace(/^(\s*← \[\w+\] .*→ )(\S+)[ \t]*$/gm, (line, head: string, path: string) => withSites(line, head, path))
+    // code_impact upstream: "  intel.ts → apps/api/src/routes/intel.ts [CALLS] (conf: 0.85)"
+    .replace(/^(\s+\S+ → )(\S+)( \[CALLS\].*)$/gm, (line, head: string, path: string, tail: string) =>
+      withSites(line, head, path, tail))
+}
+
+/**
+ * The checkout a graph result reads from. Without a project the graph answers across the
+ * organization, so the checkout is the project's that holds a file the result names: where the
+ * symbol is defined for code_context, the first caller for code_impact.
+ */
+function graphCheckout(raw: string, projectId: string | undefined, orgId: string | undefined): string | undefined {
+  try {
+    if (projectId) {
+      const dir = join(REPOS_DIR, findProject(projectId, orgId)?.id ?? projectId)
+      return existsSync(dir) ? dir : undefined
+    }
+    const definedIn = raw.match(/^\S+ \S+ → (\S+?):\d/m)?.[1] ?? raw.match(/→ (\S+) \[CALLS\]/)?.[1]
+    if (!definedIn) return undefined
+    const projects = db.prepare('SELECT id FROM projects WHERE (? IS NULL OR org_id = ?)')
+      .all(orgId ?? null, orgId ?? null) as Array<{ id: string }>
+    return projects.map((p) => join(REPOS_DIR, p.id)).find((dir) => existsSync(join(dir, definedIn)))
+  } catch {
+    return undefined
+  }
+}
+
+function readCheckoutFile(repoDir: string, path: string): string | undefined {
+  const fullPath = join(repoDir, path)
+  if (!fullPath.startsWith(`${repoDir}/`)) return undefined
+  try {
+    if (!existsSync(fullPath) || statSync(fullPath).size > MAX_READ_SIZE) return undefined
+    return readFileSync(fullPath, 'utf-8')
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -808,7 +955,15 @@ intelRouter.post('/impact', async (c) => {
       direction: direction ?? 'downstream',
     }
 
-    const results = await callGitNexusWithFallback('impact', params, projectId, scope.orgId)
+    const results = await callGitNexusWithFallback('impact', params, projectId, scope.orgId) as { raw?: string }
+    if (typeof results?.raw === 'string') {
+      results.raw = rewriteGitNexusHints(results.raw)
+      // Upstream, the callers are what breaks: name the lines that call, as code_context does.
+      if (params.direction === 'upstream' && results.raw.includes('[CALLS]')) {
+        const repoDir = graphCheckout(results.raw, projectId, scope.orgId)
+        if (repoDir) results.raw = addCallSites(results.raw, target, (path) => readCheckoutFile(repoDir, path))
+      }
+    }
 
     return c.json({
       success: true,
@@ -892,6 +1047,11 @@ intelRouter.post('/context', async (c) => {
           }
         }
       }
+    }
+
+    if (results?.raw?.includes('←')) {
+      const repoDir = graphCheckout(results.raw, projectId, scope.orgId)
+      if (repoDir) results.raw = addCallSites(results.raw, name, (path) => readCheckoutFile(repoDir, path))
     }
 
     return c.json({
@@ -1202,7 +1362,8 @@ intelRouter.post('/cypher', async (c) => {
 
     const params: Record<string, unknown> = { query: cypherQuery }
 
-    const results = await callGitNexusWithFallback('cypher', params, projectId, scope.orgId)
+    const results = await callGitNexusWithFallback('cypher', params, projectId, scope.orgId) as { raw?: string }
+    if (typeof results?.raw === 'string') results.raw = formatCypherRaw(results.raw)
     return c.json({ success: true, data: results })
   } catch (error) {
     logger.error(`Cypher query failed: ${String(error)}`)
@@ -1370,8 +1531,11 @@ intelRouter.post('/code-search', async (c) => {
       return c.json(outsideScopeResponse(projectId), 403)
     }
 
-    // Resolve collection name
-    const collectionName = `cortex-project-${projectId}`
+    // The collection is named after the project id, and agents name the repo ("cortex-hub")
+    // as the tool tells them to. Searching cortex-project-cortex-hub found no collection and
+    // said so only in a message nobody showed, so every such search came back empty.
+    const project = findProject(projectId, scope.orgId)
+    const collectionName = `cortex-project-${project?.id ?? projectId}`
 
     // Embed query through LLM gateway — routes to configured provider (Ollama bge-m3:latest)
     const embedder = createEmbedder()
@@ -1393,7 +1557,7 @@ intelRouter.post('/code-search', async (c) => {
     // "does this actually contain what was asked for", which is what lifts the
     // top few hits. Without one this stays an exact-limit vector search.
     const reranker = getReranker()
-    const fetchLimit = reranker ? Math.min(searchLimit * RERANK_OVERFETCH, 50) : searchLimit
+    const fetchLimit = Math.min(searchLimit * (reranker ? RERANK_OVERFETCH : BRANCH_OVERFETCH), 50)
 
     // Fuse a BM25 arm in when the collection was indexed with one. Each arm
     // returns its own ranking and Qdrant merges them by reciprocal rank, so a
@@ -1452,13 +1616,22 @@ intelRouter.post('/code-search', async (c) => {
     }
     const points = Array.isArray(data.result) ? data.result : (data.result?.points ?? [])
 
+    // A project indexed on several branches holds a copy of each chunk per branch, and without
+    // a branch filter every copy matches: one chunk filled four of a top five. Keep the best
+    // ranked copy of each place in the code.
+    const seen = new Set<string>()
     const hits = points.map((hit) => ({
       score: hit.score,
       filePath: hit.payload?.file_path as string | undefined,
       chunkIndex: hit.payload?.chunk_index as number | undefined,
       content: hit.payload?.content as string | undefined,
       branch: hit.payload?.branch as string | undefined,
-    }))
+    })).filter((hit) => {
+      const place = `${hit.filePath}#${hit.chunkIndex}`
+      if (seen.has(place)) return false
+      seen.add(place)
+      return true
+    })
 
     let results = hits
     let reranked = false
@@ -1484,7 +1657,7 @@ intelRouter.post('/code-search', async (c) => {
       }
     }
 
-    results = results.slice(0, searchLimit)
+    results = results.slice(0, searchLimit).map((hit) => ({ ...hit, ...chunkLines(project?.id ?? projectId, hit) }))
 
     return c.json({
       success: true,
@@ -1497,6 +1670,27 @@ intelRouter.post('/code-search', async (c) => {
     return c.json({ success: false, error: String(error) }, 500)
   }
 })
+
+/**
+ * Where a chunk sits in the project's checkout, so an agent can read those lines and not the
+ * whole file. Chunks are stored without line numbers; without them every hit was followed by a
+ * read of the entire file, 9–25k characters for a 1.5k chunk. The checkout may be on another
+ * branch than the chunk, so a chunk whose text is not in the file gets no lines.
+ */
+export function locateChunk(fileText: string, chunk: string): { startLine: number; endLine: number } | undefined {
+  const body = chunk.replace(/^\/\/ File: [^\n]*\n/, '').replace(/\s+$/, '')
+  if (!body) return undefined
+  const at = fileText.indexOf(body)
+  if (at < 0) return undefined
+  const startLine = fileText.slice(0, at).split('\n').length
+  return { startLine, endLine: startLine + body.split('\n').length - 1 }
+}
+
+function chunkLines(projectDir: string, hit: { filePath?: string; content?: string }) {
+  if (!hit.filePath || !hit.content) return {}
+  const fileText = readCheckoutFile(join(REPOS_DIR, projectDir), hit.filePath)
+  return (fileText && locateChunk(fileText, hit.content)) || {}
+}
 
 // ── File Content: read raw source file from cloned repo ──
 intelRouter.post('/file-content', async (c) => {

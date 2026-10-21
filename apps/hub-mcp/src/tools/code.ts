@@ -3,6 +3,9 @@ import { z } from 'zod'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { Env } from '../types.js'
 import { apiCall } from '../api-call.js'
+import { formatCodeMatches, type CodeMatch } from './code-matches.js'
+import { formatDiffImpact } from './diff-impact.js'
+import { LOAD_UP_FRONT } from './load-up-front.js'
 
 /**
  * Register code intelligence tools.
@@ -18,6 +21,7 @@ import { apiCall } from '../api-call.js'
 const ORG_DESC =
   "Organization ID to scope this call to. Omit it and the hub infers the organization from " +
   "your active session; a cross-repo search never leaves it."
+
 
 export function registerCodeTools(server: McpServer, env: Env) {
 
@@ -119,7 +123,8 @@ export function registerCodeTools(server: McpServer, env: Env) {
                 projectId: resolvedProject,
                 orgId: org,
               })
-              // Response shape: { success, data: { raw: "{ \"markdown\": \"...\", \"row_count\": N }\n---\n..." } }
+              // Response shape: { success, data: { raw: "| name |\n| --- |\n| … |\n(N rows)\n---\n..." } },
+              // or from a hub before the table was unwrapped, raw opens with { "markdown", "row_count" }.
               const wrapper = cypherRes as { data?: { raw?: string; formatted?: string; row_count?: number } }
               let md = ''
               let rows = 0
@@ -134,7 +139,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
                 } catch {
                   // raw might be plain text, try extracting table directly
                   md = wrapper.data.raw
-                  rows = (md.match(/\| /g) ?? []).length - 2 // rough count minus headers
+                  rows = md.split('\n').filter(l => l.startsWith('|')).length - 2 // table lines minus header and rule
                 }
               } else if (wrapper?.data?.formatted) {
                 md = wrapper.data.formatted
@@ -167,48 +172,21 @@ export function registerCodeTools(server: McpServer, env: Env) {
           }
         }
 
-        // ── Qdrant semantic code search: supplement with actual source code ──
-        const resolvedForCodeSearch = resolvedProject
-        if (resolvedForCodeSearch) {
+        // ── Qdrant semantic code search: the ranked files, ahead of the graph's flows ──
+        if (resolvedProject) {
           try {
             const codeRes = await apiCall(env, '/api/intel/code-search', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ query, projectId: resolvedForCodeSearch, orgId: org, branch, limit: limit ?? 5 }),
+              // Paths are cheap and snippets are capped, so ask for more than the flow limit.
+              body: JSON.stringify({ query, projectId: resolvedProject, orgId: org, branch, limit: Math.max(limit ?? 5, 8) }),
               signal: AbortSignal.timeout(15000),
             })
 
             if (codeRes.ok) {
-              const codeData = (await codeRes.json()) as {
-                success?: boolean
-                data?: {
-                  results?: Array<{
-                    score: number
-                    filePath?: string
-                    content?: string
-                    chunkIndex?: number
-                  }>
-                  message?: string
-                }
-              }
-
-              const codeResults = codeData?.data?.results ?? []
-              if (codeResults.length > 0) {
-                const codeLines: string[] = ['\n\n---\n**Source Code Matches** (semantic search)\n']
-                for (const hit of codeResults.slice(0, 5)) {
-                  const score = (hit.score * 100).toFixed(1)
-                  codeLines.push(`### ${hit.filePath ?? 'unknown'} (${score}% match)`)
-                  if (hit.content) {
-                    const ext = hit.filePath?.split('.').pop() ?? ''
-                    const lang = { ts: 'typescript', js: 'javascript', cs: 'csharp', py: 'python', go: 'go', rs: 'rust', java: 'java' }[ext] ?? ext
-                    codeLines.push(`\`\`\`${lang}`)
-                    codeLines.push(hit.content.slice(0, 2000))
-                    codeLines.push('```')
-                  }
-                  codeLines.push('')
-                }
-                formatted += codeLines.join('\n')
-              }
+              const codeData = (await codeRes.json()) as { data?: { results?: CodeMatch[] } }
+              const matches = formatCodeMatches(codeData?.data?.results ?? [])
+              if (matches) formatted = formatted ? `${matches}\n\n---\n${formatted}` : matches
             }
           } catch {
             // Qdrant search is best-effort
@@ -234,7 +212,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
         }
       }
     }
-  )
+  ).update(LOAD_UP_FRONT)
 
   // ── code_impact — calculate blast radius for code changes ──
   server.tool(
@@ -270,7 +248,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
             // First attempt: context lookup without file
             const contextData = await callIntel('context', {
               name: target,
-              projectId,
+              projectId: resolvedProject,
               orgId: org,
             }) as { data?: { results?: { raw?: string } } }
 
@@ -288,7 +266,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
                     const retryData = await callIntel('context', {
                       name: target,
                       file: filePath,
-                      projectId,
+                      projectId: resolvedProject,
                       orgId: org,
                     }) as { data?: { results?: { raw?: string } } }
                     contextRaw = retryData?.data?.results?.raw ?? contextRaw
@@ -297,9 +275,9 @@ export function registerCodeTools(server: McpServer, env: Env) {
               }
             }
 
-            // Extract method names from context output
-            // Pattern 1: [has_method] undefined MethodName
-            const methodMatches = contextRaw.match(/\[has_method\]\s+\w+\s+\w+/g)
+            // Extract method names from context output: "[has_method] MethodName", or from a hub
+            // older than the one that drops the missing kind, "[has_method] undefined MethodName".
+            const methodMatches = contextRaw.match(/\[has_method\]\s+(?:undefined\s+)?\w+/g)
 
             if (methodMatches && methodMatches.length > 0) {
               const methods = methodMatches
@@ -320,7 +298,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
                 try {
                   const methodImpact = await callIntel('impact', {
                     target: methods[0],
-                    projectId,
+                    projectId: resolvedProject,
                     orgId: org,
                     direction: direction ?? 'downstream',
                   }) as { data?: { results?: { raw?: string } } }
@@ -357,8 +335,9 @@ export function registerCodeTools(server: McpServer, env: Env) {
           } catch { /* ignore context failure, return original result */ }
         }
 
+        // The report is text with line breaks: inside JSON every one reads as a literal \n.
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: raw || JSON.stringify(data, null, 2) }],
         }
       } catch (error) {
         return {
@@ -405,7 +384,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
         }
       }
     }
-  )
+  ).update(LOAD_UP_FRONT)
 
   // ── detect_changes — pre-commit risk analysis ──
   // The hub cannot see the caller's working tree, so the caller sends its diff. Asking the
@@ -434,7 +413,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
           60000,
         )
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: formatDiffImpact(data) }],
         }
       } catch (error) {
         return {
@@ -448,7 +427,10 @@ export function registerCodeTools(server: McpServer, env: Env) {
   // ── cypher — direct graph queries ──
   server.tool(
     'cortex_cypher',
-    'Run Cypher queries directly against the GitNexus knowledge graph. Supports MATCH, RETURN, WHERE, ORDER BY for exploring code relationships.\n\nAvailable node properties: id, name, filePath, startLine, endLine. Use labels(n) for type, and alias it (labels(n) AS type) for a readable column.\nExample: MATCH (n) WHERE n.name CONTAINS "Attack" RETURN n.name, labels(n) LIMIT 20',
+    'Run Cypher queries directly against the GitNexus knowledge graph. Supports MATCH, RETURN, WHERE, ORDER BY for exploring code relationships.\n\n' +
+    'Node labels: Function, Method, Class, Interface, TypeAlias, Const, Property, File, Folder, Route. Node properties: id, name, filePath, startLine, endLine. Use labels(n) AS type for the type.\n' +
+    'Every edge is ONE table, CodeRelation, with its kind in r.type: CALLS, IMPORTS, DEFINES, HAS_METHOD, EXTENDS, IMPLEMENTS, ACCESSES, HANDLES_ROUTE. [:CALLS] does not exist.\n' +
+    'Example: MATCH (a)-[r:CodeRelation {type: \'CALLS\'}]->(b:Function {name: \'X\'}) RETURN a.name, labels(a) AS type, a.filePath LIMIT 20',
     {
       query: z.string().describe('Cypher query to run (e.g., MATCH (n:Function) RETURN n.name LIMIT 10)'),
       repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL'),
@@ -458,9 +440,17 @@ export function registerCodeTools(server: McpServer, env: Env) {
     async ({ query, repo, projectId, org }) => {
       try {
         const resolvedProject = await resolveRepo(repo, projectId)
-        const data = await callIntel('cypher', { query, projectId: resolvedProject, orgId: org })
+        const data = await callIntel('cypher', { query, projectId: resolvedProject, orgId: org }) as {
+          data?: { raw?: unknown }
+        }
+        const raw = data?.data?.raw
+        if (typeof raw !== 'string') {
+          return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
+        }
+        // The graph answers a failed query with an "Error:" body on a successful response.
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: raw }],
+          ...(/^Error:/.test(raw) ? { isError: true } : {}),
         }
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : 'Unknown'
